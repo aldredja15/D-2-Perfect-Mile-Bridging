@@ -230,8 +230,8 @@
 
     function parseCSV(text) {
       const lines = text.split('\n').filter(l => l.trim());
-      if (lines.length < 2) return [];
-      const headers = parseCSVLine(lines[0]).map(h => h.trim().toLowerCase().replace(/\s+/g, '_'));
+      if (lines.length < 2) return { headers: [], rows: [] };
+      const headers = parseCSVLine(lines[0]).map(h => h.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, ''));
       const rows = [];
       for (let i = 1; i < lines.length; i++) {
         const vals = parseCSVLine(lines[i]);
@@ -240,15 +240,26 @@
         headers.forEach((h, idx) => { row[h] = (vals[idx] || '').trim(); });
         rows.push(row);
       }
-      return rows;
+      return { headers, rows };
     }
 
-    function findColName(rowKeys, candidates) {
+    // Find best matching column name from the parsed headers
+    function findCol(headers, candidates) {
       for (const c of candidates) {
-        const found = rowKeys.find(k => k.toLowerCase().includes(c.toLowerCase()));
+        const clean = c.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+        const found = headers.find(h => h === clean || h.includes(clean) || clean.includes(h));
         if (found) return found;
       }
       return null;
+    }
+
+    function colVal(row, colName) {
+      if (!colName) return '';
+      return (row[colName] || '').trim();
+    }
+
+    function isBlank(val) {
+      return !val || val.trim() === '' || val.trim().toLowerCase() === 'null' || val.trim() === '-';
     }
 
     function runAnalysis() {
@@ -263,153 +274,200 @@
       const reader = new FileReader();
       reader.onload = function(e) {
         try {
-          const rows = parseCSV(e.target.result);
+          const { headers, rows } = parseCSV(e.target.result);
           if (rows.length === 0) { showError('No data found in CSV file.'); return; }
 
-          const sampleKeys = Object.keys(rows[0]);
-
-          const sortationTypeCol = findColName(sampleKeys, ['sortation_type','sort_type','swa_afn','network_type','sortation','fulfillment_type']);
-          const containerCol     = findColName(sampleKeys, ['container_id','container_label','container','cart','pallet']);
-          const shipmentCol      = findColName(sampleKeys, ['shipment_id','shipment','tracking','package_id']);
-          const bucketCol        = findColName(sampleKeys, ['bucket','failure_bucket','failure_type','process_type','error_type']);
-          const originCol        = findColName(sampleKeys, ['origin','origin_node','source_node','from_node','ib_node']);
-          const destCol          = findColName(sampleKeys, ['destination','dest','dest_node','outbound_lane','ob_lane','to_node']);
-          const beltCol          = findColName(sampleKeys, ['belt','conveyor','sorter','chute','sort_belt']);
-          const autosorterCol    = findColName(sampleKeys, ['autosorter','autosorter_last_chute','adta','shipping_sorter','last_chute']);
-          const sizeCol          = findColName(sampleKeys, ['size','package_size','pkg_size','tote_size','item_size']);
+          // ── Column mapping using exact column names from the OB dashboard ──
+          const scanLogicCol      = findCol(headers, ['scan_logic_detail', 'scan_logic', 'bucket', 'failure_bucket']);
+          const ibContainerCol    = findCol(headers, ['ib_container_label', 'ib_container', 'container_label', 'container_id']);
+          const stackDestCol      = findCol(headers, ['stack_dest_container', 'stack_dest', 'dest_container', 'belt_container']);
+          const nextNodeCol       = findCol(headers, ['next_node', 'destination', 'dest_node', 'next_destination']);
+          const ibSspLaneCol      = findCol(headers, ['ib_ssp_lane', 'ib_ssp', 'origin', 'origin_node', 'ib_node', 'source_node']);
+          const shipmentCol       = findCol(headers, ['shipment_id', 'shipment', 'tracking_id', 'package_id', 'parcel_id']);
+          const sortationTypeCol  = findCol(headers, ['sortation_type', 'sort_type', 'swa_afn', 'network_type', 'fulfillment_type']);
+          const autosorterCol     = findCol(headers, ['autosorter_last_chute', 'autosorter', 'adta', 'last_chute', 'shipping_sorter']);
+          const sizeCol           = findCol(headers, ['package_size', 'size', 'pkg_size', 'tote_size', 'item_size']);
 
           const total = rows.length;
 
-          // ANALYSIS 1 - SWA vs AFN
+          // ── ANALYSIS 1: SWA vs AFN ──
           let swaCount = 0, afnCount = 0;
           rows.forEach(row => {
-            const val = sortationTypeCol ? (row[sortationTypeCol] || '').toUpperCase() : '';
+            const val = colVal(row, sortationTypeCol).toUpperCase();
             if (val.includes('SWA')) swaCount++;
             else if (val.includes('AFN')) afnCount++;
           });
-          if (swaCount === 0 && afnCount === 0) {
-            swaCount = Math.round(total * 0.174);
-            afnCount = total - swaCount;
-          }
-          const swaAfnTotal = swaCount + afnCount;
-          const swaPct = swaAfnTotal > 0 ? ((swaCount / swaAfnTotal) * 100).toFixed(1) : '0.0';
-          const afnPct = swaAfnTotal > 0 ? ((afnCount / swaAfnTotal) * 100).toFixed(1) : '0.0';
+          const swaAfnTotal = swaCount + afnCount || total;
+          const swaPct = ((swaCount / swaAfnTotal) * 100).toFixed(1);
+          const afnPct = ((afnCount / swaAfnTotal) * 100).toFixed(1);
           const analysis1 = `Focusing on sortation misses, ${swaCount} shipments were SWA and ${afnCount} shipments were AFN. SWA contributed ${swaPct}% while AFN contributed ${afnPct}% to the total sortation misses.`;
 
-          // ANALYSIS 2 - Top 3 XD Missed Container Scans
+          // ── ANALYSIS 2: Top 3 XD Missed Container Scans ──
+          // Use ib_container_label where scan_logic_detail contains 'XDOCK'
+          // Destination from next_node, Origin from ib_ssp_lane
+          // Count unique shipments per ib_container_label
           const xdRows = rows.filter(row => {
-            const bucket = bucketCol ? (row[bucketCol] || '').toUpperCase() : '';
-            return bucket.includes('XDOCK') || bucket.includes('XD');
+            const logic = colVal(row, scanLogicCol).toUpperCase();
+            return logic.includes('XDOCK') || logic.includes('XD');
           });
+
           const xdContainerMap = {};
           xdRows.forEach(row => {
-            const container = containerCol ? (row[containerCol] || 'UNKNOWN') : 'UNKNOWN';
-            const origin = originCol ? (row[originCol] || '') : '';
-            const dest   = destCol   ? (row[destCol]   || '') : '';
-            if (!xdContainerMap[container]) xdContainerMap[container] = { count: 0, origins: new Set(), dests: new Set() };
-            xdContainerMap[container].count++;
-            if (origin) xdContainerMap[container].origins.add(origin);
-            if (dest)   xdContainerMap[container].dests.add(dest);
-          });
-          const xdRanked = Object.entries(xdContainerMap).sort((a, b) => b[1].count - a[1].count).slice(0, 3);
-          const rankOrdinal = ['first', 'second', 'third'];
-          let analysis2Lines = [];
-          xdRanked.forEach((c, i) => {
-            const pct = total > 0 ? ((c[1].count / total) * 100).toFixed(1) : '0.0';
-            const origin = [...c[1].origins][0] || 'Unknown';
-            const dest   = [...c[1].dests][0]   || 'Unknown';
-            analysis2Lines.push(`Focusing on XD missed container scans, the ${i === 0 ? 'most impacting' : rankOrdinal[i] + ' most impacting'} container was '${c[0]}' with ${c[1].count} shipments, contributing towards ${pct}% of total OB scan misses. This container arrived from '${origin}' and was sent to '${dest}'.`);
-          });
-          const analysis2 = analysis2Lines.join('\n');
+            const container = colVal(row, ibContainerCol) || 'UNKNOWN';
+            const origin    = colVal(row, ibSspLaneCol)   || 'Unknown';
+            const dest      = colVal(row, nextNodeCol)    || 'Unknown';
+            const shipment  = colVal(row, shipmentCol)    || '';
 
-          // ANALYSIS 3 - Top 3 Sort Failure Buckets
-          const bucketMap = {};
+            if (!xdContainerMap[container]) {
+              xdContainerMap[container] = { shipments: new Set(), origins: new Set(), dests: new Set() };
+            }
+            if (shipment) xdContainerMap[container].shipments.add(shipment);
+            else xdContainerMap[container].shipments.add(Math.random()); // fallback count row
+            if (!isBlank(origin)) xdContainerMap[container].origins.add(origin);
+            if (!isBlank(dest))   xdContainerMap[container].dests.add(dest);
+          });
+
+          const xdRanked = Object.entries(xdContainerMap)
+            .map(([c, v]) => ({ container: c, count: v.shipments.size, origin: [...v.origins][0] || 'Unknown', dest: [...v.dests][0] || 'Unknown' }))
+            .sort((a, b) => b.count - a.count)
+            .slice(0, 3);
+
+          const rankOrdinal = ['most impacting', 'second most impacting', 'third most impacting'];
+          const analysis2 = xdRanked.length > 0
+            ? xdRanked.map((c, i) => {
+                const pct = total > 0 ? ((c.count / total) * 100).toFixed(1) : '0.0';
+                return `Focusing on XD missed container scans, the ${rankOrdinal[i]} container was '${c.container}' with ${c.count} shipments, contributing towards ${pct}% of total OB scan misses. This container arrived from '${c.origin}' and was sent to '${c.dest}'.`;
+              }).join('\n')
+            : 'No XD failure data found.';
+
+          // ── ANALYSIS 3: Top 3 Sort Failure Buckets ──
+          // Count unique shipments per scan_logic_detail bucket
+          const bucketShipmentMap = {};
           rows.forEach(row => {
-            const bucket = bucketCol ? (row[bucketCol] || 'UNKNOWN') : 'UNKNOWN';
-            bucketMap[bucket] = (bucketMap[bucket] || 0) + 1;
+            const bucket   = colVal(row, scanLogicCol) || 'UNKNOWN';
+            const shipment = colVal(row, shipmentCol)  || '';
+            if (!bucketShipmentMap[bucket]) bucketShipmentMap[bucket] = new Set();
+            if (shipment) bucketShipmentMap[bucket].add(shipment);
+            else bucketShipmentMap[bucket].add(Math.random());
           });
-          const bucketRanked = Object.entries(bucketMap).sort((a, b) => b[1] - a[1]).slice(0, 3);
-          let analysis3Lines = [];
-          bucketRanked.forEach((b, i) => {
-            const pct = total > 0 ? ((b[1] / total) * 100).toFixed(1) : '0.0';
-            analysis3Lines.push(`The ${i === 0 ? 'top' : rankOrdinal[i]} failed bucket for OB scan was '${b[0]}' with ${b[1]} shipments, contributing towards ${pct}% of total failures.`);
-          });
-          const analysis3 = analysis3Lines.join('\n');
 
-          // ANALYSIS 4 - Top 3 Containers by Belts
-          const beltRows = beltCol ? rows.filter(row => (row[beltCol] || '').trim() !== '') : [];
+          const bucketRanked = Object.entries(bucketShipmentMap)
+            .map(([b, s]) => ({ bucket: b, count: s.size }))
+            .sort((a, b) => b.count - a.count)
+            .slice(0, 3);
+
+          const rankLabels3 = ['top', 'second', 'third'];
+          const analysis3 = bucketRanked.length > 0
+            ? bucketRanked.map((b, i) => {
+                const pct = total > 0 ? ((b.count / total) * 100).toFixed(1) : '0.0';
+                return `The ${rankLabels3[i]} failed bucket for OB scan was '${b.bucket}' with ${b.count} shipments, contributing towards ${pct}% of total failures.`;
+              }).join('\n')
+            : 'No bucket data found.';
+
+          // ── ANALYSIS 4: Top 3 Containers Created by Belts ──
+          // Use stack_dest_container as the container identifier
+          // Destination from next_node, count unique shipments
+          const beltRows = rows.filter(row => !isBlank(colVal(row, stackDestCol)));
+
           const beltContainerMap = {};
           beltRows.forEach(row => {
-            const container = containerCol ? (row[containerCol] || 'UNKNOWN') : 'UNKNOWN';
-            const dest       = destCol       ? (row[destCol]       || '')        : '';
-            if (!beltContainerMap[container]) beltContainerMap[container] = { count: 0, dests: new Set() };
-            beltContainerMap[container].count++;
-            if (dest) beltContainerMap[container].dests.add(dest);
+            const container = colVal(row, stackDestCol) || 'UNKNOWN';
+            const dest      = colVal(row, nextNodeCol)  || 'Unknown';
+            const shipment  = colVal(row, shipmentCol)  || '';
+            if (!beltContainerMap[container]) beltContainerMap[container] = { shipments: new Set(), dests: new Set() };
+            if (shipment) beltContainerMap[container].shipments.add(shipment);
+            else beltContainerMap[container].shipments.add(Math.random());
+            if (!isBlank(dest)) beltContainerMap[container].dests.add(dest);
           });
-          const beltRanked = Object.entries(beltContainerMap).sort((a, b) => b[1].count - a[1].count).slice(0, 3);
-          let analysis4Lines = [];
-          beltRanked.forEach((c, i) => {
-            const pct = total > 0 ? ((c[1].count / total) * 100).toFixed(1) : '0.0';
-            const dest = [...c[1].dests][0] || 'Unknown';
-            analysis4Lines.push(`Looking into containers that were created by the belts on site, the ${i === 0 ? 'top' : rankOrdinal[i]} container was '${c[0]}' destined for '${dest}' - ${pct}% of total OB scan misses.`);
-          });
-          const analysis4 = analysis4Lines.length > 0 ? analysis4Lines.join('\n') : 'No belt container data found.';
 
-          // ANALYSIS 5 - Shipment Level Misses
-          const laneMap = {};
-          rows.forEach(row => {
-            const dest = destCol ? (row[destCol] || '') : '';
-            if (dest) laneMap[dest] = (laneMap[dest] || 0) + 1;
-          });
-          const topLane = Object.entries(laneMap).sort((a, b) => b[1] - a[1])[0];
-          const analysis5 = `Focusing on shipment level misses, the total was ${total}. Of which, the most impacted outbound lane was '${topLane ? topLane[0] : 'Unknown'}' with ${topLane ? topLane[1] : 0} shipments.`;
+          const beltRanked = Object.entries(beltContainerMap)
+            .map(([c, v]) => ({ container: c, count: v.shipments.size, dest: [...v.dests][0] || 'Unknown' }))
+            .sort((a, b) => b.count - a.count)
+            .slice(0, 3);
 
-          // ANALYSIS 6 - ADTA Belt
-          const adtaRows = autosorterCol ? rows.filter(row => (row[autosorterCol] || '').trim() !== '' && (row[autosorterCol] || '').trim().toLowerCase() !== 'null') : [];
+          const analysis4 = beltRanked.length > 0
+            ? beltRanked.map((c, i) => {
+                const pct = total > 0 ? ((c.count / total) * 100).toFixed(1) : '0.0';
+                return `Looking into containers that were created by the belts on site, the ${rankLabels3[i]} container was '${c.container}' destined for '${c.dest}' - ${pct}% of total OB scan misses.`;
+              }).join('\n')
+            : 'No belt container data found.';
+
+          // ── ANALYSIS 5: Shipment Level Misses ──
+          // Package level sort misses: rows where stack_dest_container is blank
+          // Destination from next_node
+          const sortMissRows = rows.filter(row => {
+            const logic = colVal(row, scanLogicCol).toUpperCase();
+            return (logic.includes('SORT') || logic.includes('STACK')) && isBlank(colVal(row, stackDestCol));
+          });
+
+          const laneShipmentMap = {};
+          sortMissRows.forEach(row => {
+            const dest     = colVal(row, nextNodeCol) || 'Unknown';
+            const shipment = colVal(row, shipmentCol) || '';
+            if (!laneShipmentMap[dest]) laneShipmentMap[dest] = new Set();
+            if (shipment) laneShipmentMap[dest].add(shipment);
+            else laneShipmentMap[dest].add(Math.random());
+          });
+
+          const topLane = Object.entries(laneShipmentMap)
+            .map(([d, s]) => ({ dest: d, count: s.size }))
+            .sort((a, b) => b.count - a.count)[0];
+
+          const analysis5 = `Focusing on shipment level misses, the total was ${sortMissRows.length}. Of which, the most impacted outbound lane was '${topLane ? topLane.dest : 'Unknown'}' with ${topLane ? topLane.count : 0} shipments.`;
+
+          // ── ANALYSIS 6: ADTA Belt ──
+          const adtaRows = rows.filter(row => !isBlank(colVal(row, autosorterCol)));
           const adtaCount = adtaRows.length;
           const adtaPct   = total > 0 ? ((adtaCount / total) * 100).toFixed(1) : '0.0';
           const analysis6 = `Of all OB scan misses, ${adtaCount} packages were processed through the ADTA belt (Shipping Sorter), contributing towards ${adtaPct}% of total OB scan misses.`;
 
-          // ANALYSIS 7 - Stack Scan by Size
+          // ── ANALYSIS 7: Stack Scan Misses by Package Size ──
           const sizeMap = {};
           rows.forEach(row => {
-            const bucket = bucketCol ? (row[bucketCol] || '').toUpperCase() : '';
-            if (bucket.includes('STACK')) {
-              const size = sizeCol ? (row[sizeCol] || 'Unknown') : 'Unknown';
-              sizeMap[size] = (sizeMap[size] || 0) + 1;
+            const logic = colVal(row, scanLogicCol).toUpperCase();
+            if (logic.includes('STACK')) {
+              const size = colVal(row, sizeCol) || 'Unknown';
+              if (!sizeMap[size]) sizeMap[size] = new Set();
+              const shipment = colVal(row, shipmentCol) || '';
+              if (shipment) sizeMap[size].add(shipment);
+              else sizeMap[size].add(Math.random());
             }
           });
-          const sizeOrder = ['extra small','small','medium','large','extra large','nc plus','nc'];
-          const sizeRanked = Object.entries(sizeMap).sort((a, b) => {
-            const ai = sizeOrder.indexOf(a[0].toLowerCase());
-            const bi = sizeOrder.indexOf(b[0].toLowerCase());
-            return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
-          });
+
+          const sizeOrder = ['extra small','xs','small','s','medium','m','large','l','extra large','xl','nc plus','nc'];
+          const sizeRanked = Object.entries(sizeMap)
+            .map(([s, v]) => ({ size: s, count: v.size }))
+            .sort((a, b) => {
+              const ai = sizeOrder.indexOf(a.size.toLowerCase());
+              const bi = sizeOrder.indexOf(b.size.toLowerCase());
+              return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+            });
+
           const analysis7 = sizeRanked.length > 0
-            ? sizeRanked.map(s => `Of all the shipments missing stack scan, ${s[1]} were '${s[0]}'.`).join('\n')
+            ? sizeRanked.map(s => `Of all the shipments missing stack scan, ${s.count} were '${s.size}'.`).join('\n')
             : 'No stack scan size data found.';
 
-          // Root Causes
+          // ── Root Causes ──
           const rootCauses = [
             `SWA vs AFN Pattern: The vast majority of sortation misses (${afnPct}%) originate from AFN nodes, suggesting AFN inbound container management is the primary driver of sort failures. SWA nodes contribute a smaller but notable ${swaPct}%, indicating room for improvement across both network types.`,
-            xdRanked.length > 0 ? `Top XD Failures: ${xdRanked[0][0]} alone accounts for ${total > 0 ? ((xdRanked[0][1].count / total) * 100).toFixed(1) : 0}% of all OB scan misses, indicating a systemic departure scanning issue${[...xdRanked[0][1].origins][0] ? ' at ' + [...xdRanked[0][1].origins][0] : ''}. The concentration of XD failures on specific lanes suggests a lane-specific process breakdown.` : 'No XD failure data available.',
-            bucketRanked.length > 0 ? `Top Sort Failure Buckets: ${bucketRanked[0][0]} is the dominant failure bucket at ${total > 0 ? ((bucketRanked[0][1] / total) * 100).toFixed(1) : 0}% of failures, indicating systemic issues with the stack scanning process that require immediate operational attention.` : 'No bucket data available.'
+            xdRanked.length > 0 ? `Top XD Failures: ${xdRanked[0].container} alone accounts for ${total > 0 ? ((xdRanked[0].count / total) * 100).toFixed(1) : 0}% of all OB scan misses, indicating a systemic departure scanning issue at ${xdRanked[0].origin}. The concentration of XD failures on specific lanes suggests a lane-specific process breakdown.` : 'No XD failure data available.',
+            bucketRanked.length > 0 ? `Top Sort Failure Buckets: ${bucketRanked[0].bucket} is the dominant failure bucket at ${total > 0 ? ((bucketRanked[0].count / total) * 100).toFixed(1) : 0}% of failures, indicating systemic issues with the scanning process that require immediate operational attention.` : 'No bucket data available.'
           ];
 
-          // Corrective Actions
+          // ── Corrective Actions ──
           const correctiveActions = [
             `SWA/AFN Actions: Implement targeted process audits at AFN origin nodes to address the disproportionate ${afnPct}% contribution to sortation misses. Coordinate with FC operations teams to improve container departure scanning compliance before dispatch to SXW2.`,
-            xdRanked.length > 0 ? `XD Improvements: Deploy immediate investigation into ${xdRanked[0][0]}${[...xdRanked[0][1].origins][0] ? ' from ' + [...xdRanked[0][1].origins][0] : ''}, including equipment checks and departure scanning procedure reviews. Implement real-time alerts for containers with repeated scan failures on high-volume lanes.` : 'Review XD container departure procedures across all origin nodes.',
-            `Sort Process Improvements: Conduct urgent process audit for ${bucketRanked.length > 0 ? bucketRanked[0][0] : 'stack scan'} failures, ensuring all associates are trained on correct stacking scan procedures. Review ADTA belt operations and implement additional compliance checkpoints for packages processed through the Shipping Sorter.`
+            xdRanked.length > 0 ? `XD Improvements: Deploy immediate investigation into ${xdRanked[0].container} arriving from ${xdRanked[0].origin}, including equipment checks and departure scanning procedure reviews. Implement real-time alerts for containers with repeated scan failures on high-volume lanes.` : 'Review XD container departure procedures across all origin nodes.',
+            `Sort Process Improvements: Conduct urgent process audit for ${bucketRanked.length > 0 ? bucketRanked[0].bucket : 'stack scan'} failures, ensuring all associates are trained on correct stacking scan procedures. Review ADTA belt operations and implement additional compliance checkpoints for packages processed through the Shipping Sorter.`
           ];
 
-          const isGreen = complianceVal >= 99.2;
-          const statusText = isGreen ? 'GREEN 🟢' : 'RED 🔴';
+          const isGreen     = complianceVal >= 99.2;
+          const statusText  = isGreen ? 'GREEN 🟢' : 'RED 🔴';
           const statusBg    = isGreen ? '#E5FFE5' : '#FFE5E5';
           const statusColor = isGreen ? '#166534' : '#991b1b';
           const rankEmoji   = ['🔴', '🟠', '🟡'];
 
-          // OUTPUT 1 - PLAIN TEXT
+          // ── OUTPUT 1: PLAIN TEXT ──
           const plainText = `Outbound Scan Compliance
 XDOCK FAILURE (CURRENT NODE - UNTRACEABLE): The package has been departed as untraceable from the SC.
 XDOCK FAILURE (CURRENT NODE - DEPART SCAN): The package arrived in a XDock container and this IB container has not been departed. The package has not been scanned at shipment-level, either.
@@ -450,42 +508,39 @@ ${correctiveActions.map((r, i) => `${i+1}. ${r}`).join('\n')}`;
 
           document.getElementById('plainTextOutput').textContent = plainText;
 
-          // OUTPUT 2 - HTML REPORT
+          // ── OUTPUT 2: HTML REPORT ──
           const xdTableRows = xdRanked.map((c, i) => {
-            const pct    = total > 0 ? ((c[1].count / total) * 100).toFixed(1) : '0.0';
-            const origin = [...c[1].origins][0] || 'Unknown';
-            const dest   = [...c[1].dests][0]   || 'Unknown';
-            const bg     = i % 2 === 0 ? '#ffffff' : '#CCFBF1';
+            const pct = total > 0 ? ((c.count / total) * 100).toFixed(1) : '0.0';
+            const bg  = i % 2 === 0 ? '#ffffff' : '#CCFBF1';
             return `<tr style="background:${bg}">
               <td style="padding:10px 14px;font-weight:700">${rankEmoji[i]} #${i+1}</td>
-              <td style="padding:10px 14px;font-weight:700;font-size:12px">${c[0]}</td>
-              <td style="padding:10px 14px;text-align:center">${c[1].count}</td>
+              <td style="padding:10px 14px;font-weight:700;font-size:12px">${c.container}</td>
+              <td style="padding:10px 14px;text-align:center">${c.count}</td>
               <td style="padding:10px 14px;text-align:center;font-weight:700">${pct}%</td>
-              <td style="padding:10px 14px">${origin}</td>
-              <td style="padding:10px 14px;font-size:12px">${dest}</td>
+              <td style="padding:10px 14px">${c.origin}</td>
+              <td style="padding:10px 14px;font-size:12px">${c.dest}</td>
             </tr>`;
           }).join('');
 
           const bucketTableRows = bucketRanked.map((b, i) => {
-            const pct = total > 0 ? ((b[1] / total) * 100).toFixed(1) : '0.0';
+            const pct = total > 0 ? ((b.count / total) * 100).toFixed(1) : '0.0';
             const bg  = i % 2 === 0 ? '#ffffff' : '#CCFBF1';
             return `<tr style="background:${bg}">
               <td style="padding:10px 14px;font-weight:700">${rankEmoji[i]} #${i+1}</td>
-              <td style="padding:10px 14px;font-weight:700;font-size:12px">${b[0]}</td>
-              <td style="padding:10px 14px;text-align:center">${b[1]}</td>
+              <td style="padding:10px 14px;font-weight:700;font-size:12px">${b.bucket}</td>
+              <td style="padding:10px 14px;text-align:center">${b.count}</td>
               <td style="padding:10px 14px;text-align:center;font-weight:700">${pct}%</td>
             </tr>`;
           }).join('');
 
           const beltTableRows = beltRanked.map((c, i) => {
-            const pct  = total > 0 ? ((c[1].count / total) * 100).toFixed(1) : '0.0';
-            const dest = [...c[1].dests][0] || 'Unknown';
-            const bg   = i % 2 === 0 ? '#ffffff' : '#CCFBF1';
+            const pct = total > 0 ? ((c.count / total) * 100).toFixed(1) : '0.0';
+            const bg  = i % 2 === 0 ? '#ffffff' : '#CCFBF1';
             return `<tr style="background:${bg}">
               <td style="padding:10px 14px;font-weight:700">${rankEmoji[i]} #${i+1}</td>
-              <td style="padding:10px 14px;font-weight:700;font-size:12px">${c[0]}</td>
-              <td style="padding:10px 14px;font-size:12px">${dest}</td>
-              <td style="padding:10px 14px;text-align:center">${c[1].count}</td>
+              <td style="padding:10px 14px;font-weight:700;font-size:12px">${c.container}</td>
+              <td style="padding:10px 14px;font-size:12px">${c.dest}</td>
+              <td style="padding:10px 14px;text-align:center">${c.count}</td>
               <td style="padding:10px 14px;text-align:center;font-weight:700">${pct}%</td>
             </tr>`;
           }).join('');
@@ -493,8 +548,8 @@ ${correctiveActions.map((r, i) => `${i+1}. ${r}`).join('\n')}`;
           const sizeTableRows = sizeRanked.map((s, i) => {
             const bg = i % 2 === 0 ? '#ffffff' : '#CCFBF1';
             return `<tr style="background:${bg}">
-              <td style="padding:10px 14px;font-weight:700">${s[0]}</td>
-              <td style="padding:10px 14px;text-align:center;font-weight:700">${s[1]}</td>
+              <td style="padding:10px 14px;font-weight:700">${s.size}</td>
+              <td style="padding:10px 14px;text-align:center;font-weight:700">${s.count}</td>
             </tr>`;
           }).join('');
 
@@ -553,11 +608,11 @@ ${correctiveActions.map((r, i) => `${i+1}. ${r}`).join('\n')}`;
       <table style="width:100%;border-collapse:collapse;">
         <thead><tr style="background:#14B8A6;">
           <th style="padding:12px 14px;text-align:left;color:white;font-size:13px;">#</th>
-          <th style="padding:12px 14px;text-align:left;color:white;font-size:13px;">Container</th>
+          <th style="padding:12px 14px;text-align:left;color:white;font-size:13px;">IB Container Label</th>
           <th style="padding:12px 14px;text-align:center;color:white;font-size:13px;">Shipments</th>
           <th style="padding:12px 14px;text-align:center;color:white;font-size:13px;">% of Total</th>
-          <th style="padding:12px 14px;text-align:left;color:white;font-size:13px;">Origin</th>
-          <th style="padding:12px 14px;text-align:left;color:white;font-size:13px;">Destination</th>
+          <th style="padding:12px 14px;text-align:left;color:white;font-size:13px;">Origin (IB SSP Lane)</th>
+          <th style="padding:12px 14px;text-align:left;color:white;font-size:13px;">Destination (Next Node)</th>
         </tr></thead>
         <tbody>${xdTableRows || '<tr><td colspan="6" style="padding:16px;text-align:center;color:#94a3b8;">No XD failure data found</td></tr>'}</tbody>
       </table>
@@ -582,8 +637,8 @@ ${correctiveActions.map((r, i) => `${i+1}. ${r}`).join('\n')}`;
       <table style="width:100%;border-collapse:collapse;">
         <thead><tr style="background:#14B8A6;">
           <th style="padding:12px 14px;text-align:left;color:white;font-size:13px;">#</th>
-          <th style="padding:12px 14px;text-align:left;color:white;font-size:13px;">Container</th>
-          <th style="padding:12px 14px;text-align:left;color:white;font-size:13px;">Destination</th>
+          <th style="padding:12px 14px;text-align:left;color:white;font-size:13px;">Stack Dest Container</th>
+          <th style="padding:12px 14px;text-align:left;color:white;font-size:13px;">Destination (Next Node)</th>
           <th style="padding:12px 14px;text-align:center;color:white;font-size:13px;">Shipments</th>
           <th style="padding:12px 14px;text-align:center;color:white;font-size:13px;">% of Total</th>
         </tr></thead>
